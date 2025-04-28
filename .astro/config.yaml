@@ -1,0 +1,10 @@
+project:
+    name: finnews-summarizer-project
+
+deployments:
+  airflow:
+    dags:
+      - dags
+    include:
+      - db
+      - utils

@@ -1,54 +1,97 @@
-import requests, textstat, nltk
-from bs4 import BeautifulSoup
-from newspaper import Article
-from unidecode import unidecode
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from transformers import pipeline
-from langchain.document_loaders import WebBaseLoader
+# utils/helpers.py
 
-nltk.download("punkt")
+import requests
+from bs4 import BeautifulSoup
+import textstat
+from transformers import AutoTokenizer
+
+import torch
 
 def get_full_article_text(url):
+    """
+    Fetch the full article text given a URL.
+    """
     try:
-        article = Article(url)
-        article.download()
-        article.parse()
-        return unidecode(article.text.strip())
-    except:
-        pass
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, "lxml")
-        paragraphs = soup.find_all("p")
-        return unidecode(" ".join([p.get_text() for p in paragraphs if len(p.get_text().split()) > 5]))
-    except:
-        pass
-    try:
-        loader = WebBaseLoader(url)
-        docs = loader.load()
-        if docs:
-            return unidecode(docs[0].page_content.strip())
-    except:
-        pass
-    return "Full content not available"
+        response = requests.get(url, timeout=10)
+        if response.status_code != 200:
+            return "Full content not available"
+        soup = BeautifulSoup(response.content, 'html.parser')
+        paragraphs = soup.find_all('p')
+        text = ' '.join([para.get_text() for para in paragraphs])
+        return text if text else "Full content not available"
+    except Exception as e:
+        return "Full content not available"
 
-def get_reddit_mentions(ticker, reddit):
-    try:
-        return sum(1 for _ in reddit.subreddit("wallstreetbets").search(ticker, limit=50))
-    except:
-        return 0
 
-def enrich_article(article, vader, finbert, reddit, nlp):
-    from nltk.tokenize import sent_tokenize
+
+# Load FinBERT tokenizer
+finbert_tokenizer = AutoTokenizer.from_pretrained("yiyanghkust/finbert-tone")
+
+
+def enrich_article(article, vader, finbert_pipeline, reddit, nlp):
     text = article["article_text"]
-    return {
-        **article,
-        "reddit_mentions": get_reddit_mentions(article["ticker_symbol"], reddit),
-        "word_count": len(text.split()),
-        "sentence_count": len(sent_tokenize(text)),
-        "readability_score": textstat.flesch_reading_ease(text),
-        "sentiment_vader": vader.polarity_scores(text)["compound"],
-        "sentiment_finbert": finbert(text[:512])[0]["label"],
-        "named_entities": ", ".join([ent.text for ent in nlp(text).ents if ent.label_ in ["ORG", "PERSON"]])
-    }
+
+    # 1. Vader Sentiment
+    vader_score = vader.polarity_scores(text)["compound"]
+
+    # 2. FinBERT Sentiment (proper safe)
+    encoded_inputs = finbert_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    input_ids = encoded_inputs["input_ids"][0]
+
+    # Split into safe 510 token chunks (account for [CLS] and [SEP])
+    chunk_size = 510
+    chunks = [input_ids[i:i+chunk_size] for i in range(0, len(input_ids), chunk_size)]
+
+    finbert_sentiments = []
+
+    for chunk in chunks:
+        if len(chunk) == 0:
+            continue
+
+        # Prepare full input with [CLS] and [SEP]
+        chunk = torch.cat([
+            torch.tensor([finbert_tokenizer.cls_token_id]), 
+            chunk, 
+            torch.tensor([finbert_tokenizer.sep_token_id])
+        ])
+
+        # Send directly to FinBERT pipeline
+        inputs = finbert_tokenizer.decode(chunk, skip_special_tokens=True)
+        result = finbert_pipeline(inputs)[0]
+        finbert_sentiments.append(result["label"])
+
+    # Aggregate sentiments
+    if finbert_sentiments:
+        pos = finbert_sentiments.count("positive")
+        neg = finbert_sentiments.count("negative")
+        neu = finbert_sentiments.count("neutral")
+
+        if pos >= neg and pos >= neu:
+            final_finbert_sentiment = "positive"
+        elif neg >= pos and neg >= neu:
+            final_finbert_sentiment = "negative"
+        else:
+            final_finbert_sentiment = "neutral"
+    else:
+        final_finbert_sentiment = "neutral"
+
+    # 3. Other NLP features
+    doc = nlp(text)
+
+    article["word_count"] = len(text.split())
+    article["sentence_count"] = len(list(doc.sents))
+    article["readability_score"] = textstat.flesch_reading_ease(text) if text else 0
+    article["sentiment_vader"] = vader_score
+    article["sentiment_finbert"] = final_finbert_sentiment
+    article["named_entities"] = [ent.text for ent in doc.ents]
+
+    try:
+        subreddit = reddit.subreddit("all")
+        mentions = sum(1 for submission in subreddit.search(article["ticker_symbol"], limit=10))
+        article["reddit_mentions"] = mentions
+    except Exception as e:
+        article["reddit_mentions"] = 0
+
+    return article
+
+
