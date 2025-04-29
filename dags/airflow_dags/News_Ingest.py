@@ -25,7 +25,13 @@ REDDIT_USER_AGENT = Variable.get("reddit_user_agent")
 AWS_ACCESS_KEY = Variable.get("aws_access_key")
 AWS_SECRET_KEY = Variable.get("aws_secret_key")
 S3_BUCKET_NAME = Variable.get("s3_bucket_name")
-TICKERS = json.loads(Variable.get("tickers_list", default_var='["AAPL", "TSLA", "GOOGL"]'))
+tickers_var = Variable.get("tickers_list", default_var='["AAPL", "TSLA", "GOOGL"]')
+try:
+    TICKERS = json.loads(tickers_var)
+except Exception:
+    logging.warning("⚠️ Ticker list format wrong! Falling back to default tickers.")
+    TICKERS = ["AAPL", "TSLA", "GOOGL"]
+
 
 # === DAG Config ===
 default_args = {
@@ -41,20 +47,31 @@ default_args = {
     start_date=days_ago(1),
     schedule_interval="@daily",
     catchup=False,
-    tags=["ingestion", "enrichment", "S3"]
+    tags=["ingestion", "enrichment", "S3"],
+    params={"tickers": ["AAPL", "TSLA", "GOOGL"]}  # <-- default
 )
 def step5_dag():
 
     @task
-    def fetch_articles():
+    def fetch_articles(**kwargs):
+        tickers = kwargs["params"].get("tickers", ["AAPL", "TSLA", "GOOGL"])
+
         to_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         from_date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         all_articles = []
 
-        def from_newsapi(ticker):
+        ticker_search_mapping = {
+            "AAPL": "AAPL",
+            "TSLA": "TSLA",
+            "GOOGL": "GOOGL",
+            "META": "Meta",
+            
+        }
+
+        def from_newsapi(search_term, ticker):
             url = (
                 f"https://newsapi.org/v2/everything?"
-                f"q={ticker}&from={from_date}&to={to_date}"
+                f"q={search_term}&from={from_date}&to={to_date}"
                 f"&sortBy=publishedAt&pageSize=100&apiKey={NEWSAPI_KEY}"
             )
             logging.info(f"Fetching from NewsAPI for {ticker}")
@@ -79,8 +96,8 @@ def step5_dag():
                 "author": a.get("author", "N/A")
             } for a in res.get("articles", [])]
 
-        def from_google_news(ticker):
-            url = f"https://news.google.com/rss/search?q={ticker}+stock+market"
+        def from_google_news(search_term, ticker):
+            url = f"https://news.google.com/rss/search?q={search_term}+stock+market"
             feed = feedparser.parse(url)
             logging.info(f"Google News returned {len(feed.entries)} entries for {ticker}")
             articles = []
@@ -102,11 +119,12 @@ def step5_dag():
                     logging.error(f"Error processing entry: {e}")
             return articles
 
-        for ticker in TICKERS:
-            articles = from_newsapi(ticker) + from_google_news(ticker)
+        for ticker in tickers:
+            search_term = ticker_search_mapping.get(ticker, ticker)
+            articles = from_newsapi(search_term, ticker) + from_google_news(search_term, ticker)
             all_articles.extend(articles)
 
-        # Clean and deduplicate
+        # Deduplicate
         valid_articles = [a for a in all_articles if a and a.get("article_title")]
         unique_articles = {}
         for article in valid_articles:
@@ -141,7 +159,6 @@ def step5_dag():
 
         today_date = datetime.now().strftime('%Y-%m-%d')
 
-        # Split and upload per ticker
         ticker_groups = {}
         for row in rows:
             ticker = row.get("ticker_symbol", "UNKNOWN")
@@ -165,6 +182,9 @@ def step5_dag():
                 logging.error(f"❌ Error uploading {ticker} to S3: {e}")
                 raise e
 
-    upload_to_s3(enrich_articles(fetch_articles()))
+    # Task chaining
+    fetched = fetch_articles()
+    enriched = enrich_articles(fetched)
+    upload_to_s3(enriched)
 
 dag = step5_dag()
