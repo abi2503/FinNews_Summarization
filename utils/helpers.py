@@ -28,70 +28,54 @@ def get_full_article_text(url):
 finbert_tokenizer = AutoTokenizer.from_pretrained("yiyanghkust/finbert-tone")
 
 
-def enrich_article(article, vader, finbert_pipeline, reddit, nlp):
-    text = article["article_text"]
-
-    # 1. Vader Sentiment
-    vader_score = vader.polarity_scores(text)["compound"]
-
-    # 2. FinBERT Sentiment (proper safe)
-    encoded_inputs = finbert_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-    input_ids = encoded_inputs["input_ids"][0]
-
-    # Split into safe 510 token chunks (account for [CLS] and [SEP])
-    chunk_size = 510
-    chunks = [input_ids[i:i+chunk_size] for i in range(0, len(input_ids), chunk_size)]
-
-    finbert_sentiments = []
-
-    for chunk in chunks:
-        if len(chunk) == 0:
-            continue
-
-        # Prepare full input with [CLS] and [SEP]
-        chunk = torch.cat([
-            torch.tensor([finbert_tokenizer.cls_token_id]), 
-            chunk, 
-            torch.tensor([finbert_tokenizer.sep_token_id])
-        ])
-
-        # Send directly to FinBERT pipeline
-        inputs = finbert_tokenizer.decode(chunk, skip_special_tokens=True)
-        result = finbert_pipeline(inputs)[0]
-        finbert_sentiments.append(result["label"])
-
-    # Aggregate sentiments
-    if finbert_sentiments:
-        pos = finbert_sentiments.count("positive")
-        neg = finbert_sentiments.count("negative")
-        neu = finbert_sentiments.count("neutral")
-
-        if pos >= neg and pos >= neu:
-            final_finbert_sentiment = "positive"
-        elif neg >= pos and neg >= neu:
-            final_finbert_sentiment = "negative"
-        else:
-            final_finbert_sentiment = "neutral"
-    else:
-        final_finbert_sentiment = "neutral"
-
-    # 3. Other NLP features
-    doc = nlp(text)
-
-    article["word_count"] = len(text.split())
-    article["sentence_count"] = len(list(doc.sents))
-    article["readability_score"] = textstat.flesch_reading_ease(text) if text else 0
-    article["sentiment_vader"] = vader_score
-    article["sentiment_finbert"] = final_finbert_sentiment
-    article["named_entities"] = [ent.text for ent in doc.ents]
-
+def enrich_article(article, vader, finbert, reddit, nlp):
+    # Decode unicode-escaped text
+    article_text = article.get("article_text", "")
     try:
-        subreddit = reddit.subreddit("all")
-        mentions = sum(1 for submission in subreddit.search(article["ticker_symbol"], limit=10))
-        article["reddit_mentions"] = mentions
+        decoded_text = bytes(article_text, "utf-8").decode("unicode_escape")
     except Exception as e:
-        article["reddit_mentions"] = 0
+        logging.error(f"Unicode decode error: {e}")
+        decoded_text = article_text
+
+    article["article_text"] = decoded_text
+
+    # Sentiment
+    sentiment_vader = vader.polarity_scores(decoded_text)["compound"]
+    sentiment_finbert = finbert(decoded_text[:1000])[0]["label"] if decoded_text else "neutral"
+
+    # ✅ Safe Reddit Search
+    try:
+        reddit_mentions = reddit.subreddit("wallstreetbets").search(article.get("ticker_symbol"), limit=10)
+        reddit_count = sum(1 for _ in reddit_mentions)
+    except Exception as e:
+        logging.error(f"Reddit search error: {e}")
+        reddit_count = 0
+
+    # NER and features
+    doc = nlp(decoded_text)
+    named_entities = list(set([ent.text for ent in doc.ents]))
+
+    word_count = len(decoded_text.split())
+    sentence_count = decoded_text.count('.') + decoded_text.count('!') + decoded_text.count('?')
+
+    # Readability
+    try:
+        import textstat
+        readability_score = textstat.flesch_reading_ease(decoded_text)
+    except:
+        readability_score = 50.0
+
+    article.update({
+        "word_count": word_count,
+        "sentence_count": sentence_count,
+        "readability_score": readability_score,
+        "sentiment_vader": sentiment_vader,
+        "sentiment_finbert": sentiment_finbert,
+        "named_entities": named_entities,
+        "reddit_mentions": reddit_count
+    })
 
     return article
+
 
 
